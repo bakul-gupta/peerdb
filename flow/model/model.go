@@ -140,27 +140,23 @@ func RecToTablePKey[T Items](
 }
 
 type SyncRecordsRequest[T Items] struct {
-	Records *CDCStream[T]
-	// ConsumedOffset allows destination to confirm lsn for slot
-	ConsumedOffset *atomic.Int64
-	// FlowJobName is the name of the flow job.
-	FlowJobName string
-	// destination table name -> schema mapping
+	Records                *CDCStream[T]
+	ConsumedOffset         *atomic.Int64
 	TableNameSchemaMapping map[string]*protos.TableSchema
 	Env                    map[string]string
-	// Staging path for AVRO files in CDC
-	StagingPath string
-	// Lua script
-	Script string
-	// source:destination mappings
-	TableMappings []*protos.TableMapping
-	SyncBatchID   int64
-	Version       uint32
+	Flags                  map[string]bool
+	FlowJobName            string
+	StagingPath            string
+	Script                 string
+	TableMappings          []*protos.TableMapping
+	SyncBatchID            int64
+	Version                uint32
 }
 
 type NormalizeRecordsRequest struct {
 	Env                    map[string]string
 	TableNameSchemaMapping map[string]*protos.TableSchema
+	Flags                  map[string]bool
 	FlowJobName            string
 	SoftDeleteColName      string
 	SyncedAtColName        string
