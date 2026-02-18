@@ -548,10 +548,23 @@ func (c *PostgresConnector) createSlotAndPublication(
 		c.logger.Info("Creating replication slot", slog.String("slot", slot))
 		// CreateReplicationSlot does not support failover options and uses Postgres syntax that makes it tricky to drop in
 		// TODO: upstream pglogrepl to support this
+		// PostgreSQL 15+ requires CREATE_REPLICATION_SLOT with SNAPSHOT 'use' to be in a REPEATABLE READ transaction
+		// Wrap in BEGIN ISOLATION LEVEL REPEATABLE READ/COMMIT for compatibility
+		if _, err := conn.Exec(ctx, "BEGIN ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			conn.Close(ctx)
+			return model.SetupReplicationResult{}, fmt.Errorf("[slot] error beginning transaction: %w", err)
+		}
 		res, err := pglogrepl.ParseCreateReplicationSlot(conn.PgConn().Exec(ctx, createSlotCommand))
 		if err != nil {
+			if _, rollbackErr := conn.Exec(ctx, "ROLLBACK"); rollbackErr != nil {
+				c.logger.Warn("failed to rollback transaction after slot creation error", slog.Any("error", rollbackErr))
+			}
 			conn.Close(ctx)
 			return model.SetupReplicationResult{}, fmt.Errorf("[slot] error creating replication slot: %w", err)
+		}
+		if _, err := conn.Exec(ctx, "COMMIT"); err != nil {
+			conn.Close(ctx)
+			return model.SetupReplicationResult{}, fmt.Errorf("[slot] error committing transaction: %w", err)
 		}
 		c.logger.Info("Created replication slot", slog.String("slot", slot))
 
