@@ -3,6 +3,7 @@ package connpostgres
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -58,6 +59,8 @@ type PostgresConnector struct {
 	metadataSchema         string
 	replLock               sync.Mutex
 	pgVersion              shared.PGVersion
+	cachedIsYugabyteDB     *bool // cached YugabyteDB detection result
+	yugabyteDBLock         sync.Mutex
 }
 
 func NewPostgresConnector(ctx context.Context, env map[string]string, pgConfig *protos.PostgresConfig) (*PostgresConnector, error) {
@@ -2013,4 +2016,43 @@ func (c *PostgresConnector) GetTableSizeEstimatedBytes(ctx context.Context, tabl
 		return 0, errors.New("table size is not valid")
 	}
 	return tableSizeBytes.Int64, nil
+}
+
+// isYugabyteDB checks if the database is YugabyteDB by checking the version string.
+// YugabyteDB version strings contain "-YB-" (e.g., "11.2-YB-2.17.3.0-b0").
+func (c *PostgresConnector) isYugabyteDB(ctx context.Context) (bool, error) {
+	c.yugabyteDBLock.Lock()
+	defer c.yugabyteDBLock.Unlock()
+
+	if c.cachedIsYugabyteDB != nil {
+		return *c.cachedIsYugabyteDB, nil
+	}
+
+	var version string
+	err := c.conn.QueryRow(ctx, "SHOW server_version").Scan(&version)
+	if err != nil {
+		return false, fmt.Errorf("failed to get server version: %w", err)
+	}
+
+	isYB := strings.Contains(version, "-YB-")
+	c.cachedIsYugabyteDB = &isYB
+
+	if isYB {
+		c.logger.Info("[yugabyte] detected YugabyteDB", slog.String("version", version))
+	}
+
+	return isYB, nil
+}
+
+// isYugabyteDBSnapshotFormat detects YugabyteDB snapshot format.
+// YugabyteDB returns snapshot IDs as two hexadecimal strings separated by a hyphen,
+// e.g., "0c5552334715443889a5853cecebbde0-a17df8001013e3a5584816ef87cb2577"
+func isYugabyteDBSnapshotFormat(snapshotName string) bool {
+	before, after, found := strings.Cut(snapshotName, "-")
+	if !found || before == "" || after == "" || strings.Contains(after, "-") {
+		return false
+	}
+	_, err1 := hex.DecodeString(before)
+	_, err2 := hex.DecodeString(after)
+	return err1 == nil && err2 == nil
 }

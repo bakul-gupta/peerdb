@@ -6,15 +6,11 @@ import (
 	"log/slog"
 	"math/rand/v2"
 
-	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
-	"go.temporal.io/sdk/temporal"
 
-	"github.com/PeerDB-io/peerdb/flow/connectors/utils"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/shared"
-	"github.com/PeerDB-io/peerdb/flow/shared/exceptions"
 )
 
 type RecordStreamSink struct {
@@ -31,16 +27,8 @@ func (stream RecordStreamSink) ExecuteQueryWithTx(
 ) (int64, int64, error) {
 	defer shared.RollbackTx(tx, qe.logger)
 
-	if qe.snapshot != "" {
-		if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+utils.QuoteLiteral(qe.snapshot)); err != nil {
-			qe.logger.Error("[pg_query_executor] failed to set snapshot",
-				slog.Any("error", err), slog.String("query", query))
-			if shared.IsSQLStateError(err, pgerrcode.UndefinedObject, pgerrcode.InvalidParameterValue) {
-				return 0, 0, temporal.NewNonRetryableApplicationError("failed to set transaction snapshot",
-					exceptions.ApplicationErrorTypeIrrecoverableInvalidSnapshot.String(), err)
-			}
-			return 0, 0, fmt.Errorf("[pg_query_executor] failed to set snapshot: %w", err)
-		}
+	if err := qe.setTransactionSnapshot(ctx, tx, qe.snapshot); err != nil {
+		return 0, 0, err
 	}
 
 	//nolint:gosec // number has no cryptographic significance

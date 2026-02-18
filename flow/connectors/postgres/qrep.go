@@ -96,6 +96,21 @@ func (c *PostgresConnector) GetDefaultPartitionKeyForTables(
 		TableDefaultPartitionKeyMapping: make(map[string]string, len(input.TableMappings)),
 	}
 
+	// Check if we're on YugabyteDB - it doesn't support ctid system column
+	isYB, err := c.isYugabyteDB(ctx)
+	if err != nil {
+		c.logger.Warn("[yugabyte] failed to detect YugabyteDB, proceeding with standard checks",
+			slog.Any("error", err))
+		isYB = false
+	}
+
+	if isYB {
+		c.logger.Info("[yugabyte] YugabyteDB detected - skipping ctid partition key (not supported)",
+			slog.String("reason", "YugabyteDB does not support the ctid system column"))
+		// Don't set ctid as partition key for YugabyteDB - fall back to full table partitions
+		return output, nil
+	}
+
 	pgVersion, err := shared.GetMajorVersion(ctx, c.conn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine server version: %w", err)
@@ -148,14 +163,23 @@ func (c *PostgresConnector) GetDefaultPartitionKeyForTables(
 }
 
 func (c *PostgresConnector) setTransactionSnapshot(ctx context.Context, tx pgx.Tx, snapshot string) error {
-	if snapshot != "" {
-		if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+utils.QuoteLiteral(snapshot)); err != nil {
-			if shared.IsSQLStateError(err, pgerrcode.UndefinedObject, pgerrcode.InvalidParameterValue) {
-				return temporal.NewNonRetryableApplicationError("failed to set transaction snapshot",
-					exceptions.ApplicationErrorTypeIrrecoverableInvalidSnapshot.String(), err)
-			}
-			return fmt.Errorf("failed to set transaction snapshot: %w", err)
+	if snapshot == "" {
+		return nil
+	}
+
+	// YugabyteDB doesn't support numeric snapshot IDs from replication slots,
+	// only its native hyphen-separated hex format from pg_export_snapshot()
+	if isYB, err := c.isYugabyteDB(ctx); err == nil && isYB && !isYugabyteDBSnapshotFormat(snapshot) {
+		c.logger.Warn("[yugabyte] skipping SET TRANSACTION SNAPSHOT for non-YugabyteDB snapshot format",
+			slog.String("snapshot", snapshot))
+		return nil
+	}
+	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+utils.QuoteLiteral(snapshot)); err != nil {
+		if shared.IsSQLStateError(err, pgerrcode.UndefinedObject, pgerrcode.InvalidParameterValue) {
+			return temporal.NewNonRetryableApplicationError("failed to set transaction snapshot",
+				exceptions.ApplicationErrorTypeIrrecoverableInvalidSnapshot.String(), err)
 		}
+		return fmt.Errorf("failed to set transaction snapshot: %w", err)
 	}
 
 	return nil
@@ -167,9 +191,24 @@ func (c *PostgresConnector) getPartitions(
 	config *protos.QRepConfig,
 	last *protos.QRepPartition,
 ) ([]*protos.QRepPartition, error) {
+	// Check if we're on YugabyteDB and trying to use ctid - YugabyteDB doesn't support it
+	isYB, err := c.isYugabyteDB(ctx)
+	if err != nil {
+		c.logger.Warn("[yugabyte] failed to detect YugabyteDB in getPartitions, proceeding",
+			slog.Any("error", err))
+		isYB = false
+	}
+
+	if isYB && config.WatermarkColumn == ctidColumnName {
+		return nil, fmt.Errorf("YugabyteDB does not support ctid system column for partitioning. " +
+			"Please use a different watermark column or use full table partitions")
+	}
+
 	numRowsPerPartition := int64(config.NumRowsPerPartition)
 	numPartitions := int64(config.NumPartitionsOverride)
-	schemaTable, err := common.ParseTableIdentifier(config.WatermarkTable)
+
+	var schemaTable *common.QualifiedTable
+	schemaTable, err = common.ParseTableIdentifier(config.WatermarkTable)
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse watermark table: %w", err)
 	}
